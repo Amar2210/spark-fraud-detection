@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Spark
+*.jar
+spark-warehouse/
+metastore_db/
+
+# Credentials (NEVER push these)
+*.json
+!clickhouse/schema.sql
+!grafana/dashboard.json
+service-account-key.json
