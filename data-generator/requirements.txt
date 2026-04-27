@@ -1,0 +1,5 @@
+# Core dependencies
+Faker==33.1.0               # Generates realistic Indian names (en_IN locale)
+
+# GCP SDK (only needed for pubsub mode, not for local/csv testing)
+google-cloud-pubsub==2.27.1

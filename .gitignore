@@ -22,3 +22,10 @@ metastore_db/
 !clickhouse/schema.sql
 !grafana/dashboard.json
 service-account-key.json
+
+# Generator output files
+output/
+*.csv
+
+# Logs
+*.log

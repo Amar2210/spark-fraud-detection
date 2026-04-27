@@ -1,0 +1,64 @@
+#!/bin/bash
+# =============================================================
+# Server 1 Setup Script — Data Generator
+# =============================================================
+# Run this on a fresh Ubuntu 22.04 GCP VM (e2-medium)
+# Usage: bash scripts/setup-generator-server.sh
+# =============================================================
+
+set -e  # Exit on any error
+
+echo "=========================================="
+echo "Setting up Data Generator Server"
+echo "=========================================="
+
+# Step 1: Update system packages
+echo "[1/5] Updating system packages..."
+sudo apt update && sudo apt upgrade -y
+
+# Step 2: Install Python 3.11 and essentials
+echo "[2/5] Installing Python 3.11..."
+sudo apt install -y python3.11 python3-pip python3.11-venv git curl
+
+# Step 3: Set up project directory
+echo "[3/5] Setting up project directory..."
+cd ~
+
+# Clone repo if not already present
+if [ ! -d "spark-fraud-detection" ]; then
+    echo "Cloning repository..."
+    # REPLACE <your-username> with your GitHub username
+    git clone https://github.com/<your-username>/spark-fraud-detection.git
+else
+    echo "Repository exists, pulling latest..."
+    cd spark-fraud-detection && git pull origin main && cd ~
+fi
+
+# Step 4: Create virtual environment and install dependencies
+echo "[4/5] Setting up Python virtual environment..."
+cd ~/spark-fraud-detection/data-generator
+python3.11 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# Step 5: Configure GCP project
+echo "[5/5] Configuring GCP project..."
+gcloud config set project spark-fraud-detection
+
+# Verify Pub/Sub access
+echo "Verifying Pub/Sub access..."
+gcloud pubsub topics describe transactions-stream
+
+echo "=========================================="
+echo "Setup complete!"
+echo "=========================================="
+echo ""
+echo "To start the generator:"
+echo "  cd ~/spark-fraud-detection/data-generator"
+echo "  source venv/bin/activate"
+echo "  python generator.py                  # Test locally (prints to console)"
+echo "  python generator.py --count 10       # Generate exactly 10 transactions"
+echo "  python generator.py --mode csv       # Write to CSV file"
+echo "  python generator.py --mode pubsub    # Publish to Pub/Sub (production)"
+echo ""

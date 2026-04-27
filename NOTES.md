@@ -514,3 +514,125 @@ cd ~/spark-fraud-detection && git pull origin main
 - Control 4 axes independently: global diversity, local diversity, complexity, quality
 - Better data > more data (quality scales better than quantity)
 - Embed realistic patterns (geographic impossibility, velocity abuse, etc.)
+
+---
+
+## Phase 2 Deep Dive: Data Generator Design & Decisions
+
+### Transaction Schema — 29 Fields
+
+Each transaction JSON has 29 fields grouped into 7 categories:
+
+**Identity (2):** `transaction_id`, `timestamp`
+**Card & User (5):** `card_id`, `card_holder`, `card_type`, `card_limit`, `card_age_months`
+**Transaction (5):** `amount`, `currency`, `merchant_name`, `merchant_category`, `is_online`
+**Location (4):** `location_lat`, `location_lon`, `city`, `country`
+**Device (3):** `device_id`, `device_type`, `channel`
+**Financial Profile (6):** `monthly_income`, `active_emis`, `total_emi_amount`, `credit_utilization_pct`, `months_since_last_default`, `avg_monthly_spend`
+**Labels (3):** `is_fraud`, `fraud_type`, `fraud_confidence`
+
+### What We Deliberately LEFT OUT (Spark Computes These)
+
+These 6 behavioral fields are NOT in the output — Spark computes them as feature engineering:
+- `transactions_last_1hr` → Spark window: COUNT(*) OVER (PARTITION BY card_id, 1-hour window)
+- `transactions_last_24hr` → Spark window: COUNT(*) OVER (PARTITION BY card_id, 24-hour window)
+- `avg_transaction_amount_30d` → Spark rolling: AVG(amount) OVER (PARTITION BY card_id, 30-day window)
+- `is_new_merchant` → Spark: check if merchant_name has appeared for this card_id before
+- `distance_from_last_txn_km` → Spark: lag() to get previous lat/lon, then Haversine UDF
+- `minutes_since_last_txn` → Spark: lag() on timestamp, compute difference
+
+**Why?** This gives Spark meaningful work to do (feature engineering on a stream). The generator
+still tracks these internally to CRAFT realistic fraud, but doesn't output them.
+
+### How the Generator Uses Internal History to Craft Fraud
+
+The generator keeps a lightweight internal memory per cardholder (~3 KB each):
+- `recent_transactions`: deque(maxlen=10) — last 10 transactions (city, lat, lon, time, amount)
+- `known_merchants`: set — merchants this person has used (capped at 20)
+
+This is NOT in the output. It's only used so fraud patterns are realistic:
+- Geographic anomaly: checks last city, deliberately picks a far-away city
+- Account takeover: checks avg spend, creates a transaction 3-25x higher
+- Velocity abuse: ensures rapid-fire transactions from same card
+
+Without this, fraud labels would be random and wouldn't match the actual data
+(e.g., "geographic anomaly" but both transactions in the same city).
+
+### Memory Impact on VM
+
+25,000 cardholders × ~3 KB each = ~75 MB. VM has 4 GB RAM. No problem.
+The deque(maxlen=10) ensures memory stays FLAT — old transactions auto-drop.
+
+### Traffic Pattern — 3-Layer Rate System
+
+The generator runs continuously, varying its speed based on:
+
+**Layer 1 — Hourly curve:** A dictionary maps each hour (0-23) to a multiplier (0.03 to 1.0).
+Peak hours are 12 PM and 7 PM (multiplier 1.0). Dead zone is 2-3 AM (multiplier 0.03).
+
+**Layer 2 — Random jitter:** Each cycle multiplies by random.uniform(0.5, 1.5).
+This means 2 PM might be 600 txn/hr one day and 400 the next. Realistic variance.
+
+**Layer 3 — Burst events:** 3% probability per hour of a "flash sale" burst.
+During burst, rate spikes to 3-5x normal for 10-30 minutes, then returns to normal.
+
+**Approximate daily volume:**
+- Target: ~24,000 transactions/day
+- Per cardholder: ~1 transaction/day (realistic for banking)
+- Quiet hours (2-5 AM): ~50-100 txn/hr
+- Peak hours (12-2 PM, 6-8 PM): ~1,500-2,000 txn/hr
+- Burst events (rare): ~3,000-5,000 txn/hr for 10-30 minutes
+
+### Fraud Configuration
+
+- Fraud rate: 4% (real-world is 0.1-0.5%, inflated for meaningful dashboards)
+- 5 fraud types with weighted distribution:
+  - Card Not Present: 30% of fraud
+  - Account Takeover: 25%
+  - Geographic Anomaly: 20%
+  - Velocity Abuse: 15%
+  - Friendly Fraud: 10%
+- 3 complexity levels:
+  - Easy (30%): confidence 0.70-0.95, obvious red flags
+  - Medium (45%): confidence 0.40-0.70, needs multiple signals
+  - Hard (25%): confidence 0.15-0.40, subtle, almost looks normal
+
+### Cardholder Profiles
+
+25,000 cardholders distributed across 4 segments:
+- High Income (13.6%): ₹1.5L-5L/month, credit cards, electronics/travel/fashion
+- Mid Income (47.5%): ₹40K-1.5L/month, credit/debit, groceries/retail/dining
+- Low Income (29.1%): ₹15K-40K/month, debit only, groceries/fuel/utilities
+- Student (9.8%): ₹5K-15K/month, debit only, dining/entertainment/retail
+
+### File Structure
+
+```
+data-generator/
+├── requirements.txt              # Faker + google-cloud-pubsub
+├── config.py                     # All tuneable settings (env var overrides)
+├── generator.py                  # Main engine: CardHolder class, fraud crafting,
+│                                 # traffic pattern, publishers, main loop
+└── schemas/
+    ├── __init__.py               # Makes schemas a Python package
+    └── transaction_schema.py     # Merchant categories, cities, fraud taxonomy,
+                                  # cardholder profiles, hourly rate curve
+```
+
+### Running the Generator
+
+```bash
+# Test locally (prints JSON to console)
+python generator.py --mode local --count 10
+
+# Generate to CSV file
+python generator.py --mode csv --count 1000
+
+# Run continuously in real-time (production)
+python generator.py --mode pubsub
+
+# Override settings via environment variables
+export FRAUD_RATE=0.05
+export NUM_CARDHOLDERS=50000
+python generator.py
+```
