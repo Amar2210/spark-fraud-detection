@@ -306,11 +306,128 @@ python generator.py
 
 ---
 
-## Phase 3: Spark Processing Server (Server 2)
+## Phase 3: Spark + Kafka Processing Server (Server 2)
+
+> **Architecture Decision: Why Kafka Instead of Pub/Sub for Spark?**
+>
+> We originally planned to have Spark read directly from Pub/Sub. But Google Cloud
+> Pub/Sub (standard) does NOT have a native Spark Structured Streaming connector.
+> Pub/Sub Lite had one, but was shut down in March 2026.
+>
+> Our options were:
+> 1. Stay with Pub/Sub, use a Python pull-loop to feed Spark (hacky, loses streaming features)
+> 2. Use Google Managed Kafka (costs money, not free tier)
+> 3. Self-host Kafka on the spark-processor VM (free, native Spark connector, industry standard)
+>
+> We chose **Option 3** because:
+> - Spark has a first-class Kafka connector (`spark-sql-kafka`) — proper streaming with
+>   watermarks, stateful processing, and checkpointing all work natively
+> - Kafka is THE industry standard for streaming — every data engineering job mentions it
+> - It's free — runs on our existing 16 GB VM alongside Spark
+> - KRaft mode (Kafka 3.x+) eliminated the ZooKeeper dependency, making self-hosting simple
+>
+> **The updated pipeline:**
+> ```
+> Generator (VM1) → Kafka (on VM2) → Spark (on VM2) → ClickHouse → Grafana
+> ```
+> The generator now publishes directly to Kafka instead of Pub/Sub.
+> Pub/Sub topic still exists but is no longer in the main data path.
+
+---
+
+### Kafka Concepts (My Understanding)
+
+> **What is Kafka?**
+> Apache Kafka is a distributed event streaming platform. Think of it as a high-performance
+> message queue that stores messages durably on disk (not just in memory like some queues).
+> It was originally built by LinkedIn to handle their activity stream data.
+
+> **Kafka vs Pub/Sub — The Differences That Matter:**
+>
+> | Concept | Pub/Sub | Kafka |
+> |---------|---------|-------|
+> | Message storage | Google manages it, 7-day retention | You manage it, configurable retention |
+> | Consumer model | Pull + ACK (message removed after ACK) | Offset-based (consumer tracks position, messages stay) |
+> | Replay | Can't re-read acknowledged messages | Can re-read from any point (rewind the offset) |
+> | Partitioning | Google handles it | You choose partition count + partition key |
+> | Infrastructure | Fully managed (zero setup) | Self-managed (install + configure) |
+> | Spark support | No native connector | Native connector (`spark-sql-kafka`) |
+>
+> The biggest conceptual difference is **offset-based consumption**:
+>
+> **Pub/Sub model (mailbox):**
+> ```
+> Message arrives → you pick it up → you ACK it → message is GONE from your queue
+> If you want to re-read it, too bad — it's been acknowledged and removed
+> ```
+>
+> **Kafka model (book with a bookmark):**
+> ```
+> Message arrives → stored at position #47 in the topic
+> You read position #47 → your bookmark moves to #48
+> Want to re-read #47? Just move your bookmark back to #47
+> The message is still there (until retention period expires)
+> ```
+>
+> This is why Kafka is better for Spark streaming — if Spark crashes at position #3000,
+> it restarts and moves the bookmark back to #3000. No messages lost, no duplicates.
+> This is exactly what GCS checkpoints were supposed to do for Pub/Sub, but Kafka
+> handles it natively and more reliably.
+
+> **Core Kafka Concepts:**
+>
+> **Broker** = The Kafka server process. In our case, one broker running on the
+> spark-processor VM. In production, you'd have 3+ brokers for redundancy.
+>
+> **Topic** = A named stream of messages (like Pub/Sub topic). Our topic: `transactions`.
+> Messages are appended to the end of the topic and stay there for the retention period.
+>
+> **Partition** = A topic is split into partitions for parallelism. Each partition is an
+> ordered, immutable sequence of messages. We'll use 3 partitions (enough for our volume).
+> Messages within a partition are ordered; messages across partitions are NOT ordered.
+>
+> **Offset** = The position number of a message within a partition. Offset 0 is the first
+> message, offset 1 is the second, etc. Consumers track their offset to know where they
+> left off.
+>
+> **Producer** = Something that writes messages to a topic (our data generator).
+>
+> **Consumer / Consumer Group** = Something that reads messages from a topic (our Spark job).
+> A consumer group is a set of consumers that share the work of reading partitions.
+> Each partition is read by exactly one consumer in the group.
+>
+> **KRaft mode** = Kafka's newer consensus protocol that replaces ZooKeeper.
+> ZooKeeper was a separate service that Kafka needed for cluster coordination.
+> KRaft builds this into Kafka itself, so we only need to run one process.
+>
+> **Visual:**
+> ```
+> Producer (generator.py)
+>       │
+>       ▼
+> ┌─────────────────────────────────────────┐
+> │  Topic: "transactions"                  │
+> │  ┌──────────────┐                       │
+> │  │ Partition 0  │  msg0, msg3, msg6...  │
+> │  └──────────────┘                       │
+> │  ┌──────────────┐                       │
+> │  │ Partition 1  │  msg1, msg4, msg7...  │
+> │  └──────────────┘                       │
+> │  ┌──────────────┐                       │
+> │  │ Partition 2  │  msg2, msg5, msg8...  │
+> │  └──────────────┘                       │
+> └─────────────────────────────────────────┘
+>       │
+>       ▼
+> Consumer Group: "spark-fraud-processor"
+>   Consumer 1 reads Partition 0
+>   Consumer 2 reads Partition 1
+>   Consumer 3 reads Partition 2
+> ```
+
+---
 
 ### Step 9 — Create the VM
-
-Same process as Server 1, but bigger:
 
 1. Go to **Compute Engine → Create Instance**
 2. Settings:
@@ -319,27 +436,28 @@ Same process as Server 1, but bigger:
    - Zone: `asia-south1-a`
    - Machine type: `e2-standard-4` (4 vCPU, 16 GB RAM)
    - Boot disk: Ubuntu 22.04 LTS, **30 GB**, Standard persistent disk
+   - Identity and API access: **Allow full access to all Cloud APIs**
    - Firewall: ✅ Allow HTTP, ✅ Allow HTTPS
 3. Click **Create**
 
-### Step 10 — SSH and Install Spark
+### Step 10 — SSH and Install Java + Spark
 
 ```bash
 # Update system
 sudo apt update && sudo apt upgrade -y
 
-# Install Java 11 (Spark requirement)
+# Install Java 11 (required by both Spark and Kafka)
 sudo apt install -y openjdk-11-jdk
 
 # Verify Java
 java -version
 # Should show: openjdk version "11.x.x"
 
-# Download and install Spark 3.5
+# Download and install Spark 3.5.8
 cd /opt
-sudo wget https://dlcdn.apache.org/spark/spark-3.5.3/spark-3.5.3-bin-hadoop3.tgz
-sudo tar xzf spark-3.5.3-bin-hadoop3.tgz
-sudo mv spark-3.5.3-bin-hadoop3 /opt/spark
+sudo wget https://dlcdn.apache.org/spark/spark-3.5.8/spark-3.5.8-bin-hadoop3.tgz
+sudo tar xzf spark-3.5.8-bin-hadoop3.tgz
+sudo mv spark-3.5.8-bin-hadoop3 /opt/spark
 
 # Set environment variables
 echo 'export SPARK_HOME=/opt/spark' >> ~/.bashrc
@@ -349,30 +467,97 @@ source ~/.bashrc
 
 # Verify Spark
 spark-submit --version
+```
 
-# Install Python, pip, and PySpark
+### Step 11 — Install Kafka (KRaft mode, no ZooKeeper)
+
+```bash
+# Download Kafka 3.7.x (uses KRaft mode by default)
+cd /opt
+sudo wget https://dlcdn.apache.org/kafka/3.7.2/kafka_2.13-3.7.2.tgz
+sudo tar xzf kafka_2.13-3.7.2.tgz
+sudo mv kafka_2.13-3.7.2 /opt/kafka
+
+# Set environment variables
+echo 'export KAFKA_HOME=/opt/kafka' >> ~/.bashrc
+echo 'export PATH=$PATH:$KAFKA_HOME/bin' >> ~/.bashrc
+source ~/.bashrc
+
+# Generate a unique cluster ID for KRaft
+KAFKA_CLUSTER_ID=$(/opt/kafka/bin/kafka-storage.sh random-uuid)
+
+# Format the Kafka storage directory
+/opt/kafka/bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID \
+    -c /opt/kafka/config/kraft/server.properties
+
+# Start Kafka (runs in background)
+/opt/kafka/bin/kafka-server-start.sh -daemon /opt/kafka/config/kraft/server.properties
+
+# Wait a few seconds, then verify Kafka is running
+sleep 5
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+# Should return empty (no topics yet) but no errors = Kafka is running
+```
+
+### Step 12 — Create the Kafka Topic
+
+```bash
+# Create the transactions topic with 3 partitions
+/opt/kafka/bin/kafka-topics.sh --create \
+    --topic transactions \
+    --bootstrap-server localhost:9092 \
+    --partitions 3 \
+    --replication-factor 1
+
+# Verify it exists
+/opt/kafka/bin/kafka-topics.sh --describe \
+    --topic transactions \
+    --bootstrap-server localhost:9092
+```
+
+> **Why 3 partitions?**
+> Each partition can be read by one Spark task in parallel. 3 partitions = 3 parallel
+> readers. For our volume (~1,000 txn/hr), even 1 partition would be enough, but 3
+> gives us some parallelism for faster processing and is more realistic.
+>
+> **Why replication-factor 1?**
+> We only have one broker (one VM). Replication requires multiple brokers.
+> In production you'd use 3 brokers with replication-factor 3 for fault tolerance.
+
+### Step 13 — Install Python, Clone Repo, Set Up Environments
+
+```bash
+# Install Python
 sudo apt install -y python3.11 python3-pip python3.11-venv git
+
+# Clone repo
 cd ~
-git clone https://github.com/<your-username>/spark-fraud-detection.git
-cd spark-fraud-detection/spark-processor
+git clone https://github.com/Amar2210/spark-fraud-detection.git
+
+# Set up Spark processor environment
+cd ~/spark-fraud-detection/spark-processor
 python3.11 -m venv venv
 source venv/bin/activate
+pip install --upgrade pip
+pip install pyspark==3.5.8
 pip install -r requirements.txt
 ```
 
-### Step 11 — Run the Spark Streaming Job
+### Step 14 — Run the Spark Streaming Job
 
 ```bash
 cd ~/spark-fraud-detection/spark-processor
 source venv/bin/activate
 
 spark-submit \
-  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3 \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8 \
   fraud_detector.py
 ```
 
-> **Note:** The exact packages may change depending on whether we use the Pub/Sub
-> connector or the Kafka-compatible Pub/Sub Lite. Will update this when we build the job.
+> **What does `--packages` do?**
+> It tells Spark to download the Kafka connector JAR from Maven Central
+> and add it to the classpath. This JAR contains the code that lets Spark
+> do `readStream.format("kafka")`. First run downloads it; subsequent runs use cache.
 
 ---
 
@@ -463,8 +648,29 @@ gcloud compute ssh spark-processor --zone=asia-south1-a
 gcloud compute instances start data-generator --zone=asia-south1-a
 gcloud compute instances stop data-generator --zone=asia-south1-a
 
-# Check Pub/Sub messages
+# Check Pub/Sub messages (legacy, before Kafka migration)
 gcloud pubsub subscriptions pull transactions-stream-sub --limit=5
+
+# Kafka commands (run on spark-processor VM)
+# Start Kafka
+/opt/kafka/bin/kafka-server-start.sh -daemon /opt/kafka/config/kraft/server.properties
+
+# Stop Kafka
+/opt/kafka/bin/kafka-server-stop.sh
+
+# List all topics
+/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# Describe a topic (see partitions, offsets)
+/opt/kafka/bin/kafka-topics.sh --describe --topic transactions --bootstrap-server localhost:9092
+
+# Read messages from topic (console consumer — for debugging)
+/opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+    --topic transactions --from-beginning --max-messages 5
+
+# Check consumer group offsets (see how far Spark has read)
+/opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+    --group spark-fraud-processor --describe
 
 # Monitor costs
 gcloud billing accounts list
@@ -491,6 +697,11 @@ cd ~/spark-fraud-detection && git pull origin main
 | ClickHouse connection refused | Whitelist your Server 2's external IP in ClickHouse Cloud settings |
 | Grafana not loading | Open port 3000 in GCP firewall rules for Server 2 |
 | VM won't start after stopping | Check if billing account is still active and has credits |
+| Kafka won't start | Check Java is installed (`java -version`). Check logs: `cat /opt/kafka/logs/server.log` |
+| Kafka "connection refused" on 9092 | Kafka isn't running. Start it: `/opt/kafka/bin/kafka-server-start.sh -daemon ...` |
+| Spark can't connect to Kafka | Make sure Kafka is running on same VM. Check `--packages` flag includes kafka connector |
+| Generator can't publish to Kafka | Verify topic exists: `kafka-topics.sh --list`. Check Kafka is on port 9092 |
+| ACCESS_TOKEN_SCOPE_INSUFFICIENT | Stop VM → Edit → Change scopes to "Allow full access to all Cloud APIs" → Start |
 
 ---
 
@@ -508,131 +719,44 @@ cd ~/spark-fraud-detection && git pull origin main
 - Pub/Sub = managed, zero infrastructure, great for GCP-native projects
 - Kafka = self-managed, more configurable, better for multi-cloud or on-premise
 - For portfolio projects, Pub/Sub saves days of configuration time
+- **BUT** Pub/Sub has no native Spark Structured Streaming connector (Pub/Sub Lite had one, shut down March 2026)
+- We started with Pub/Sub (tested it, confirmed it works) then migrated to Kafka for the Spark integration
+- Kafka runs on the spark-processor VM in KRaft mode (no ZooKeeper needed)
+- Kafka uses ~2-3 GB RAM — fits comfortably alongside Spark on 16 GB VM
+
+### Why Kafka Won (Architecture Decision)
+- Spark has a native Kafka connector (`spark-sql-kafka-0-10`) — proper streaming
+- Kafka's offset-based model: consumer tracks position, can rewind and replay
+- Pub/Sub's ACK model: once acknowledged, message is gone — no replay
+- Kafka offsets + Spark checkpoints = exactly-once semantics naturally
+- "Kafka → Spark Streaming" is the most recognized pattern in data engineering interviews
+
+### Kafka Key Concepts Learned
+- **Broker**: the Kafka server process (we run 1, production uses 3+)
+- **Topic**: named stream of messages (`transactions`), like Pub/Sub topic
+- **Partition**: topic split for parallelism; messages ordered within partition, not across
+- **Offset**: position number within a partition (0, 1, 2...) — consumer's bookmark
+- **Consumer Group**: set of consumers sharing the work; each partition → 1 consumer
+- **KRaft**: Kafka's built-in consensus (replaced ZooKeeper in Kafka 3.x+)
+- **Retention**: messages stay on disk for configurable time (default 7 days, unlike Pub/Sub where ACK removes them)
+
+### Sync vs Async (Learned from Pub/Sub Flush Bug)
+- Synchronous: do one thing, wait for it to finish, then do the next thing
+- Asynchronous: fire off many things at once, collect results later
+- `publisher.publish()` returns a "future" (a promise of a result that doesn't exist yet)
+- `future.result()` blocks until the result actually arrives
+- Our flush bug: program exited before futures resolved → messages lost
+- Fix: collect all futures, then wait for each one before exiting
+
+### Batching & Flushing (Learned from Generator)
+- Batching: collect N messages in a pile, send them all at once (1 network trip instead of N)
+- Flushing: the act of sending the accumulated batch to the destination
+- If batch_size=50 and you only generate 10, flush() must be called manually before exit
+- Every API call has network overhead: TCP handshake (~30ms) + TLS (~50ms) + send + confirm
+- Batching amortizes this overhead across many messages
 
 ### Synthetic Data Design (from Google's Simula paper)
 - Don't generate random data — design a taxonomy of what you're simulating
 - Control 4 axes independently: global diversity, local diversity, complexity, quality
 - Better data > more data (quality scales better than quantity)
 - Embed realistic patterns (geographic impossibility, velocity abuse, etc.)
-
----
-
-## Phase 2 Deep Dive: Data Generator Design & Decisions
-
-### Transaction Schema — 29 Fields
-
-Each transaction JSON has 29 fields grouped into 7 categories:
-
-**Identity (2):** `transaction_id`, `timestamp`
-**Card & User (5):** `card_id`, `card_holder`, `card_type`, `card_limit`, `card_age_months`
-**Transaction (5):** `amount`, `currency`, `merchant_name`, `merchant_category`, `is_online`
-**Location (4):** `location_lat`, `location_lon`, `city`, `country`
-**Device (3):** `device_id`, `device_type`, `channel`
-**Financial Profile (6):** `monthly_income`, `active_emis`, `total_emi_amount`, `credit_utilization_pct`, `months_since_last_default`, `avg_monthly_spend`
-**Labels (3):** `is_fraud`, `fraud_type`, `fraud_confidence`
-
-### What We Deliberately LEFT OUT (Spark Computes These)
-
-These 6 behavioral fields are NOT in the output — Spark computes them as feature engineering:
-- `transactions_last_1hr` → Spark window: COUNT(*) OVER (PARTITION BY card_id, 1-hour window)
-- `transactions_last_24hr` → Spark window: COUNT(*) OVER (PARTITION BY card_id, 24-hour window)
-- `avg_transaction_amount_30d` → Spark rolling: AVG(amount) OVER (PARTITION BY card_id, 30-day window)
-- `is_new_merchant` → Spark: check if merchant_name has appeared for this card_id before
-- `distance_from_last_txn_km` → Spark: lag() to get previous lat/lon, then Haversine UDF
-- `minutes_since_last_txn` → Spark: lag() on timestamp, compute difference
-
-**Why?** This gives Spark meaningful work to do (feature engineering on a stream). The generator
-still tracks these internally to CRAFT realistic fraud, but doesn't output them.
-
-### How the Generator Uses Internal History to Craft Fraud
-
-The generator keeps a lightweight internal memory per cardholder (~3 KB each):
-- `recent_transactions`: deque(maxlen=10) — last 10 transactions (city, lat, lon, time, amount)
-- `known_merchants`: set — merchants this person has used (capped at 20)
-
-This is NOT in the output. It's only used so fraud patterns are realistic:
-- Geographic anomaly: checks last city, deliberately picks a far-away city
-- Account takeover: checks avg spend, creates a transaction 3-25x higher
-- Velocity abuse: ensures rapid-fire transactions from same card
-
-Without this, fraud labels would be random and wouldn't match the actual data
-(e.g., "geographic anomaly" but both transactions in the same city).
-
-### Memory Impact on VM
-
-25,000 cardholders × ~3 KB each = ~75 MB. VM has 4 GB RAM. No problem.
-The deque(maxlen=10) ensures memory stays FLAT — old transactions auto-drop.
-
-### Traffic Pattern — 3-Layer Rate System
-
-The generator runs continuously, varying its speed based on:
-
-**Layer 1 — Hourly curve:** A dictionary maps each hour (0-23) to a multiplier (0.03 to 1.0).
-Peak hours are 12 PM and 7 PM (multiplier 1.0). Dead zone is 2-3 AM (multiplier 0.03).
-
-**Layer 2 — Random jitter:** Each cycle multiplies by random.uniform(0.5, 1.5).
-This means 2 PM might be 600 txn/hr one day and 400 the next. Realistic variance.
-
-**Layer 3 — Burst events:** 3% probability per hour of a "flash sale" burst.
-During burst, rate spikes to 3-5x normal for 10-30 minutes, then returns to normal.
-
-**Approximate daily volume:**
-- Target: ~24,000 transactions/day
-- Per cardholder: ~1 transaction/day (realistic for banking)
-- Quiet hours (2-5 AM): ~50-100 txn/hr
-- Peak hours (12-2 PM, 6-8 PM): ~1,500-2,000 txn/hr
-- Burst events (rare): ~3,000-5,000 txn/hr for 10-30 minutes
-
-### Fraud Configuration
-
-- Fraud rate: 4% (real-world is 0.1-0.5%, inflated for meaningful dashboards)
-- 5 fraud types with weighted distribution:
-  - Card Not Present: 30% of fraud
-  - Account Takeover: 25%
-  - Geographic Anomaly: 20%
-  - Velocity Abuse: 15%
-  - Friendly Fraud: 10%
-- 3 complexity levels:
-  - Easy (30%): confidence 0.70-0.95, obvious red flags
-  - Medium (45%): confidence 0.40-0.70, needs multiple signals
-  - Hard (25%): confidence 0.15-0.40, subtle, almost looks normal
-
-### Cardholder Profiles
-
-25,000 cardholders distributed across 4 segments:
-- High Income (13.6%): ₹1.5L-5L/month, credit cards, electronics/travel/fashion
-- Mid Income (47.5%): ₹40K-1.5L/month, credit/debit, groceries/retail/dining
-- Low Income (29.1%): ₹15K-40K/month, debit only, groceries/fuel/utilities
-- Student (9.8%): ₹5K-15K/month, debit only, dining/entertainment/retail
-
-### File Structure
-
-```
-data-generator/
-├── requirements.txt              # Faker + google-cloud-pubsub
-├── config.py                     # All tuneable settings (env var overrides)
-├── generator.py                  # Main engine: CardHolder class, fraud crafting,
-│                                 # traffic pattern, publishers, main loop
-└── schemas/
-    ├── __init__.py               # Makes schemas a Python package
-    └── transaction_schema.py     # Merchant categories, cities, fraud taxonomy,
-                                  # cardholder profiles, hourly rate curve
-```
-
-### Running the Generator
-
-```bash
-# Test locally (prints JSON to console)
-python generator.py --mode local --count 10
-
-# Generate to CSV file
-python generator.py --mode csv --count 1000
-
-# Run continuously in real-time (production)
-python generator.py --mode pubsub
-
-# Override settings via environment variables
-export FRAUD_RATE=0.05
-export NUM_CARDHOLDERS=50000
-python generator.py
-```
