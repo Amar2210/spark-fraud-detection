@@ -735,12 +735,27 @@ class PubSubPublisher:
             self.flush()
 
     def flush(self):
+        """
+        Send all buffered messages to Pub/Sub and WAIT for confirmation.
+
+        Why wait? publisher.publish() is asynchronous — it returns a "future"
+        (a promise) immediately without actually sending. If we don't call
+        future.result(), the program can exit before messages reach Google.
+
+        future.result() blocks until Google says "I received this message"
+        and returns the message ID. Only then do we clear the batch.
+        """
         if not self._batch:
             return
+        futures = []
         for txn in self._batch:
             data = json.dumps(txn).encode("utf-8")
-            self.publisher.publish(self.topic_path, data=data)
-        logger.debug(f"Published batch of {len(self._batch)} messages to Pub/Sub.")
+            future = self.publisher.publish(self.topic_path, data=data)
+            futures.append(future)
+        # Wait for ALL messages to be confirmed by Google
+        for future in futures:
+            future.result()  # blocks until confirmed
+        logger.info(f"Flushed {len(self._batch)} messages to Pub/Sub.")
         self._batch.clear()
 
 
