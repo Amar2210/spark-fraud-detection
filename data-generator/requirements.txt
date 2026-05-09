@@ -2,4 +2,4 @@
 Faker==33.1.0               # Generates realistic Indian names (en_IN locale)
 
 # Kafka producer
-confluent-kafka==2.6.1
+confluent-kafka==2.14.0
