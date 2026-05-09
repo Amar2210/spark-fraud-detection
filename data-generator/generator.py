@@ -42,7 +42,7 @@ from faker import Faker
 
 from config import (
     NUM_CARDHOLDERS, TARGET_DAILY_TRANSACTIONS, FRAUD_RATE,
-    GCP_PROJECT_ID, PUBSUB_TOPIC, PUBSUB_BATCH_SIZE,
+    KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_BATCH_SIZE,
     CSV_OUTPUT_PATH, MAX_RECENT_TRANSACTIONS, MAX_KNOWN_MERCHANTS,
     LOG_EVERY_N, LOG_LEVEL,
 )
@@ -711,23 +711,34 @@ class CsvPublisher:
             self._file.close()
 
 
-class PubSubPublisher:
+class KafkaPublisher:
     """
-    Publishes transactions to Google Cloud Pub/Sub.
+    Publishes transactions to Apache Kafka.
     Batches messages for efficiency.
 
-    Requires: google-cloud-pubsub package
+    Requires: confluent-kafka package
     """
 
-    def __init__(self, project_id: str, topic_id: str, batch_size: int):
-        # Import here so local/csv modes don't need the GCP SDK installed
-        from google.cloud import pubsub_v1
+    def __init__(self, bootstrap_servers: str, topic: str, batch_size: int):
+        from confluent_kafka import Producer
 
-        self.publisher = pubsub_v1.PublisherClient()
-        self.topic_path = self.publisher.topic_path(project_id, topic_id)
+        if not bootstrap_servers:
+            raise ValueError("KAFKA_BOOTSTRAP_SERVERS is not set")
+
+        self.producer = Producer({
+            'bootstrap.servers': bootstrap_servers,
+            'acks': 'all',
+            'batch.size': 16384,
+            'linger.ms': 5,
+        })
+        self.topic = topic
         self.batch_size = batch_size
         self._batch: List[Dict] = []
-        logger.info(f"PubSub publisher ready. Topic: {self.topic_path}")
+        logger.info(f"Kafka publisher ready. Topic: {self.topic}, Servers: {bootstrap_servers}")
+
+    def _delivery_callback(self, err, msg):
+        if err:
+            logger.error(f"Kafka delivery failed: {err}")
 
     def publish(self, txn: Dict):
         self._batch.append(txn)
@@ -735,27 +746,17 @@ class PubSubPublisher:
             self.flush()
 
     def flush(self):
-        """
-        Send all buffered messages to Pub/Sub and WAIT for confirmation.
-
-        Why wait? publisher.publish() is asynchronous — it returns a "future"
-        (a promise) immediately without actually sending. If we don't call
-        future.result(), the program can exit before messages reach Google.
-
-        future.result() blocks until Google says "I received this message"
-        and returns the message ID. Only then do we clear the batch.
-        """
         if not self._batch:
             return
-        futures = []
         for txn in self._batch:
-            data = json.dumps(txn).encode("utf-8")
-            future = self.publisher.publish(self.topic_path, data=data)
-            futures.append(future)
-        # Wait for ALL messages to be confirmed by Google
-        for future in futures:
-            future.result()  # blocks until confirmed
-        logger.info(f"Flushed {len(self._batch)} messages to Pub/Sub.")
+            self.producer.produce(
+                self.topic,
+                key=txn.get('transaction_id', '').encode('utf-8'),
+                value=json.dumps(txn).encode('utf-8'),
+                callback=self._delivery_callback
+            )
+        self.producer.flush()
+        logger.info(f"Flushed {len(self._batch)} messages to Kafka.")
         self._batch.clear()
 
 
@@ -766,8 +767,8 @@ class PubSubPublisher:
 def main():
     parser = argparse.ArgumentParser(description="Transaction Data Generator")
     parser.add_argument(
-        "--mode", choices=["local", "csv", "pubsub"], default="local",
-        help="Output mode: local (console), csv (file), pubsub (GCP)",
+        "--mode", choices=["local", "csv", "kafka"], default="local",
+        help="Output mode: local (console), csv (file), kafka (Kafka topic)",
     )
     parser.add_argument(
         "--count", type=int, default=0,
@@ -780,8 +781,8 @@ def main():
         publisher = LocalPublisher()
     elif args.mode == "csv":
         publisher = CsvPublisher(CSV_OUTPUT_PATH)
-    elif args.mode == "pubsub":
-        publisher = PubSubPublisher(GCP_PROJECT_ID, PUBSUB_TOPIC, PUBSUB_BATCH_SIZE)
+    elif args.mode == "kafka":
+        publisher = KafkaPublisher(KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPIC, KAFKA_BATCH_SIZE)
 
     # Create the generator (initializes 25,000 cardholders)
     generator = TransactionGenerator()

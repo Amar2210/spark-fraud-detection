@@ -34,16 +34,15 @@ FRAUD_RATE = float(os.getenv("FRAUD_RATE", "0.04"))  # 4% default
 
 
 # =============================================================================
-# PUB/SUB SETTINGS (for when we wire up Pub/Sub later)
+# KAFKA SETTINGS
 # =============================================================================
 
-GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "spark-fraud-detection")
-PUBSUB_TOPIC = os.getenv("PUBSUB_TOPIC", "transactions-stream")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "transactions")
 
 # How many messages to batch before publishing
-# Pub/Sub is more efficient when you send messages in batches
-# rather than one at a time
-PUBSUB_BATCH_SIZE = int(os.getenv("PUBSUB_BATCH_SIZE", "50"))
+# Kafka is more efficient when you send messages in batches
+KAFKA_BATCH_SIZE = int(os.getenv("KAFKA_BATCH_SIZE", "50"))
 
 
 # =============================================================================
