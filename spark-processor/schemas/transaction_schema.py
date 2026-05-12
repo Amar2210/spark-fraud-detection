@@ -1,0 +1,35 @@
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType,
+    IntegerType, BooleanType, TimestampType
+)
+
+TRANSACTION_SCHEMA = StructType([
+    StructField("transaction_id", StringType(), False),
+    StructField("timestamp", TimestampType(), False),
+    StructField("card_id", StringType(), False),
+    StructField("card_holder", StringType(), True),
+    StructField("card_type", StringType(), True),
+    StructField("card_limit", IntegerType(), True),
+    StructField("card_age_months", IntegerType(), True),
+    StructField("amount", DoubleType(), False),
+    StructField("currency", StringType(), True),
+    StructField("merchant_name", StringType(), True),
+    StructField("merchant_category", StringType(), True),
+    StructField("is_online", BooleanType(), True),
+    StructField("location_lat", DoubleType(), True),
+    StructField("location_lon", DoubleType(), True),
+    StructField("city", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("device_id", StringType(), True),
+    StructField("device_type", StringType(), True),
+    StructField("channel", StringType(), True),
+    StructField("monthly_income", IntegerType(), True),
+    StructField("active_emis", IntegerType(), True),
+    StructField("total_emi_amount", IntegerType(), True),
+    StructField("credit_utilization_pct", DoubleType(), True),
+    StructField("months_since_last_default", IntegerType(), True),
+    StructField("avg_monthly_spend", IntegerType(), True),
+    StructField("is_fraud", BooleanType(), True),
+    StructField("fraud_type", StringType(), True),
+    StructField("fraud_confidence", DoubleType(), True),
+])
